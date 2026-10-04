@@ -32,6 +32,8 @@
  *     → Mvu.replaceMvuData 写回 → 刷新楼层显示
  *   基底固定取"之前"的楼层而不是本楼层的当前值, 这样反复保存同一份正文结果一致,
  *   不会把 `var 好感度 += 5` 叠加两次.
+ *   只对"最新的一条 AI 楼层"生效: 更早的楼层之上已经堆了别的楼层, 它们仍建立在
+ *   旧值上, 单独重算这一楼会让同一份变量出现两套历史.
  *
  * ---------------------------------------------------------------------------
  * 语句语法
@@ -238,6 +240,9 @@ const IDENTIFIER_SOURCE = String.raw`[\p{L}_$][\p{L}\p{N}_$]*`;
 const PATH_TAIL_SOURCE = String.raw`(?:\.${IDENTIFIER_SOURCE}|\[\s*\d+\s*\]|\["[^"]*"\]|\['[^']*'\])`;
 const PATH_SOURCE = String.raw`${IDENTIFIER_SOURCE}${PATH_TAIL_SOURCE}*`;
 const PATH_PATTERN = new RegExp(String.raw`^${PATH_SOURCE}$`, 'u');
+
+/** 单个标识符(别名、函数名、形参名都只允许这个形状) */
+const IDENTIFIER_PATTERN = new RegExp(String.raw`^${IDENTIFIER_SOURCE}$`, 'u');
 
 function isPath(path: string): boolean {
   return path.length > 0 && PATH_PATTERN.test(path);
@@ -978,6 +983,28 @@ const FUNCTIONS: Record<string, FunctionDefinition> = {
   ceil: { kind: 'combine', arity: [1, 1], call: ([value]) => Math.ceil(toNumber(value, 'ceil 的参数')) },
   round: { kind: 'combine', arity: [1, 1], call: ([value]) => Math.round(toNumber(value, 'round 的参数')) },
   abs: { kind: 'combine', arity: [1, 1], call: ([value]) => Math.abs(toNumber(value, 'abs 的参数')) },
+  /**
+   * 浮点数近似相等: `|a - b| <= tol`, 不传 `tol` 时用 `1e-12`.
+   *
+   * 给"两条不同路径算出来的同一个量"做对照用 —— 直接写 `a == b` 时浮点误差会让它变成 false.
+   * `approx` 是同一个函数的别名, 两种拼写都能用.
+   */
+  isclose: {
+    kind: 'combine',
+    arity: [2, 3],
+    call: ([left, right, tolerance]) => {
+      const difference = Math.abs(toNumber(left, 'isclose 的 a') - toNumber(right, 'isclose 的 b'));
+      return difference <= (tolerance === undefined ? 1e-12 : toNumber(tolerance, 'isclose 的 tol'));
+    },
+  },
+  approx: {
+    kind: 'combine',
+    arity: [2, 3],
+    call: ([left, right, tolerance]) => {
+      const difference = Math.abs(toNumber(left, 'approx 的 a') - toNumber(right, 'approx 的 b'));
+      return difference <= (tolerance === undefined ? 1e-12 : toNumber(tolerance, 'approx 的 tol'));
+    },
+  },
   concat: {
     kind: 'combine',
     arity: [1, Infinity],
@@ -1141,6 +1168,60 @@ const FUNCTIONS: Record<string, FunctionDefinition> = {
 
 /* ============================ 求值 ============================ */
 
+/** `define` 定义的块内局部函数 */
+type LocalFunction = {
+  params: string[];
+  body: ExprNode;
+  line: number;
+};
+
+/**
+ * 一块语句共用的局部环境.
+ *
+ * `let` 建立的路径别名、`define` 建立的局部函数、函数形参与 `sum` 的循环变量都放在这里.
+ * 每次执行(一整块语句)新建一份, 语句之间共享 —— 所以 `let` 之后的语句都能用这个别名,
+ * 而下一条消息里的语句不会再看到它(别名只在这一块里有效).
+ */
+type Env = {
+  /** `let` 建立的路径别名: 短名 -> 真实路径 */
+  aliases: Map<string, string>;
+  /** `define` 建立的局部函数 */
+  funcs: Map<string, LocalFunction>;
+  /** 函数形参 / `sum` 循环变量的取值 */
+  locals: Record<string, unknown>;
+  /** 局部函数的递归深度, 防止写出无限递归把页面卡死 */
+  depth: number;
+};
+
+function createEnv(): Env {
+  return { aliases: new Map(), funcs: new Map(), locals: {}, depth: 0 };
+}
+
+/** 局部函数的递归上限, 只为挡住写错的死循环 */
+const MAX_CALL_DEPTH = 64;
+
+/** `sum(变量, 起始, 终止, 表达式)` 的循环次数上限, 同上 */
+const MAX_LOOP_ITERATIONS = 100000;
+
+/**
+ * 把路径的第一段替换成别名指向的真实路径.
+ *
+ * `let d = 微分方程` 之后, `d.题11` 就是 `微分方程.题11`; 别名只在整段相等时生效,
+ * 别名是 `题` 时 `题目.x` 不受影响. 别名指向的路径不必已经存在, 它同样可以是写入目标.
+ */
+function resolveAlias(path: string, env: Env): string {
+  const segments = _.toPath(path);
+  const head = segments[0];
+  if (head === undefined) {
+    return path;
+  }
+  const target = env.aliases.get(head);
+  if (target === undefined) {
+    return path;
+  }
+  return _.toPath(target).concat(segments.slice(1)).join('.');
+}
+
 type EvalContext = {
   /** 整个基础变量表, 供 `{{路径}}` 读取 */
   data: Record<string, any>;
@@ -1148,6 +1229,8 @@ type EvalContext = {
   subject: unknown;
   /** 当前语句的赋值符, 用于禁止变换类函数配合 `+=` 之类的增量写法 */
   operator: AssignmentOperator;
+  /** 本块语句的局部环境 */
+  env: Env;
 };
 
 function evalNode(node: ExprNode, context: EvalContext): unknown {
@@ -1156,12 +1239,19 @@ function evalNode(node: ExprNode, context: EvalContext): unknown {
       return node.value;
 
     case 'variable': {
-      const path = _.toPath(node.path);
+      const path = _.toPath(resolveAlias(node.path, context.env));
       return _.has(context.data, path) ? _.get(context.data, path) : null;
     }
 
     case 'constant': {
-      // 裸标识符: 先当作基础变量里的路径, 再当作数学常量
+      // 裸标识符: 先当函数形参 / `sum` 循环变量, 再当 `let` 别名, 再当基础变量里的路径, 最后当数学常量
+      if (Object.prototype.hasOwnProperty.call(context.env.locals, node.name)) {
+        return context.env.locals[node.name];
+      }
+      if (context.env.aliases.has(node.name)) {
+        const aliased = _.toPath(resolveAlias(node.name, context.env));
+        return _.has(context.data, aliased) ? _.get(context.data, aliased) : null;
+      }
       const path = _.toPath(node.name);
       if (_.has(context.data, path)) {
         return _.get(context.data, path);
@@ -1302,6 +1392,70 @@ function compareValues(operator: string, left: unknown, right: unknown): boolean
   }
 }
 
+/** 调用 `define` 定义的局部函数: 形参绑定实参后求值函数体 */
+function callLocalFunction(
+  node: { name: string; args: ExprNode[] },
+  definition: LocalFunction,
+  context: EvalContext,
+): unknown {
+  if (node.args.length !== definition.params.length) {
+    throw new StatementError(
+      `\`${node.name}\` 需要 ${definition.params.length} 个参数, 实际给了 ${node.args.length} 个`,
+    );
+  }
+  if (context.env.depth >= MAX_CALL_DEPTH) {
+    throw new StatementError(`\`${node.name}\` 递归超过 ${MAX_CALL_DEPTH} 层, 可能是死循环`);
+  }
+  const values = node.args.map(argument => evalNode(argument, context));
+  const locals = { ...context.env.locals };
+  definition.params.forEach((param, position) => {
+    locals[param] = values[position];
+  });
+  return evalNode(definition.body, {
+    ...context,
+    env: { ...context.env, locals, depth: context.env.depth + 1 },
+  });
+}
+
+/** 取出 `sum(循环变量, …)` 第一个参数里的循环变量名 */
+function loopVariableName(node: ExprNode): string | null {
+  if (node.kind === 'constant') {
+    return node.name;
+  }
+  if (node.kind === 'variable') {
+    const segments = _.toPath(node.path);
+    return segments.length === 1 ? segments[0]! : null;
+  }
+  return null;
+}
+
+/**
+ * `sum(循环变量, 起始, 终止, 表达式)`: 从 `起始` 到 `终止` 逐个代入求和, **含两端**, 步长 1;
+ * `终止 < 起始` 得 0. 与 Python 里 `sum(表达式 for 变量 in range(起始, 终止 + 1))` 等价.
+ */
+function evalRangeSum(node: { name: string; args: ExprNode[] }, context: EvalContext): unknown {
+  const name = loopVariableName(node.args[0]!);
+  if (name === null) {
+    throw new StatementError('sum 的第一个参数必须是循环变量名, 例如 `sum(i, 1, 10, 1 / i ** 2)`');
+  }
+  const start = Math.trunc(toNumber(evalNode(node.args[1]!, context), 'sum 的起始值'));
+  const end = Math.trunc(toNumber(evalNode(node.args[2]!, context), 'sum 的终止值'));
+  if (end < start) {
+    return 0;
+  }
+  const rounds = end - start + 1;
+  if (rounds > MAX_LOOP_ITERATIONS) {
+    throw new StatementError(`sum 要循环 ${rounds} 次, 超过上限 ${MAX_LOOP_ITERATIONS}`);
+  }
+  const body = node.args[3]!;
+  let total: unknown = 0;
+  for (let value = start; value <= end; value++) {
+    const locals = { ...context.env.locals, [name]: value };
+    total = addValues(total, evalNode(body, { ...context, env: { ...context.env, locals } }));
+  }
+  return total;
+}
+
 function evalCall(node: { name: string; args: ExprNode[] }, context: EvalContext): unknown {
   // `if` 惰性求值, 只算被选中的分支
   if (node.name === 'if') {
@@ -1310,6 +1464,17 @@ function evalCall(node: { name: string; args: ExprNode[] }, context: EvalContext
     }
     const condition = toBoolean(evalNode(node.args[0]!, context), 'if 的条件');
     return evalNode(condition ? node.args[1]! : node.args[2]!, context);
+  }
+
+  // `define` 定义的局部函数优先于内置函数, 允许覆盖同名内置函数
+  const local_function = context.env.funcs.get(node.name);
+  if (local_function) {
+    return callLocalFunction(node, local_function, context);
+  }
+
+  // `sum(循环变量, 起始, 终止, 表达式)`: 区间求和; 单参数的 `sum(数组)` 仍走内置实现
+  if (node.name === 'sum' && node.args.length === 4) {
+    return evalRangeSum(node, context);
   }
 
   const definition = FUNCTIONS[node.name];
@@ -1348,8 +1513,18 @@ function evalCall(node: { name: string; args: ExprNode[] }, context: EvalContext
 
 type AssignmentOperator = '=' | '+=' | '-=' | '*=' | '/=';
 
+/**
+ * 一条语句.
+ *
+ * - `var`: `name` 是要写入的路径
+ * - `let`: `name` 是短名, `alias` 是它指向的真实路径(路径别名, 不产生写入)
+ * - `define`: `name` 是函数名, `params` 是形参名(不产生写入)
+ */
 type Statement = {
-  path: string;
+  kind: 'var' | 'let' | 'define';
+  name: string;
+  alias: string;
+  params: string[];
   operator: AssignmentOperator;
   expression: ExprNode;
   line: number;
@@ -1361,47 +1536,135 @@ const STATEMENT_PATTERN = new RegExp(
   'u',
 );
 
-/** 行首像 `var xxx` 但整行不合法, 用来把静默忽略变成提示 */
-const VAR_LIKE_PATTERN = /^[ \t]*var[ \t]+\S/u;
+/** `let 短名 = 路径`: 给长路径起个短名 */
+const LET_PATTERN = new RegExp(String.raw`^[ \t]*let[ \t]+(${IDENTIFIER_SOURCE})[ \t]*=[ \t]*(.*)$`, 'u');
+
+/** `define 名(形参, …) = 表达式`(`def` 是同一个写法的缩写) */
+const DEFINE_PATTERN = new RegExp(
+  String.raw`^[ \t]*(?:define|def)[ \t]+(${IDENTIFIER_SOURCE})[ \t]*\(([^)]*)\)[ \t]*=[ \t]*(.*)$`,
+  'u',
+);
+
+/** 行首像一条语句但整行不合法, 用来把静默忽略变成提示 */
+const STATEMENT_LIKE_PATTERN = /^[ \t]*(?:var|let|define|def)[ \t]+\S/u;
 
 type ParsedLine = { ok: true; statement: Statement } | { ok: false; line: number; raw: string; message: string };
 
-/** 扫描正文中所有以 `var` 开头的行 */
+/** 解析一条语句的表达式部分(顺带处理行内 `#` 注释) */
+function parseExpression(source: string): ExprNode {
+  const tokens = tokenize(source);
+  if (tokens.length === 0) {
+    throw new StatementError('缺少表达式');
+  }
+  return new Parser(tokens).parse();
+}
+
+/** 从语法树还原"纯路径"写法(如 `微分方程.题11_y`、`队伍[0].等级`); 不是路径时返回 null */
+function astToPath(node: ExprNode): string | null {
+  const segments: string[] = [];
+  let current: ExprNode = node;
+  for (;;) {
+    if (current.kind === 'index') {
+      const key = current.index;
+      if (key.kind !== 'literal' || (typeof key.value !== 'string' && typeof key.value !== 'number')) {
+        return null;
+      }
+      segments.unshift(String(key.value));
+      current = current.object;
+      continue;
+    }
+    if (current.kind === 'variable' || current.kind === 'constant') {
+      const head = current.kind === 'variable' ? current.path : current.name;
+      segments.unshift(..._.toPath(head));
+      return segments.join('.');
+    }
+    return null;
+  }
+}
+
+/** 扫描正文中所有以 `var` / `let` / `define` 开头的行 */
 function parseStatements(text: string): ParsedLine[] {
   const results: ParsedLine[] = [];
 
   text.split(/\r?\n/).forEach((raw, index) => {
     const line = index + 1;
-    const match = STATEMENT_PATTERN.exec(raw);
-    if (!match) {
-      // 行首像 var 语句但整行不合法时给出提示, 而不是静默忽略
-      if (VAR_LIKE_PATTERN.test(raw)) {
-        results.push({
-          ok: false,
-          line,
-          raw,
-          message: '语句格式不合法, 应为 `var <路径> <赋值符> <表达式>`',
-        });
-      }
-      return;
-    }
-    const [, path, operator, source] = match;
-    if (!source || source.trim() === '') {
-      results.push({ ok: false, line, raw, message: '缺少表达式' });
-      return;
-    }
-    try {
-      const tokens = tokenize(source);
-      if (tokens.length === 0) {
-        throw new StatementError('缺少表达式');
-      }
-      const expression = new Parser(tokens).parse();
-      results.push({
-        ok: true,
-        statement: { path: path!, operator: operator as AssignmentOperator, expression, line, raw },
-      });
-    } catch (error) {
+    const fail = (error: unknown) => {
       results.push({ ok: false, line, raw, message: error instanceof Error ? error.message : String(error) });
+    };
+    const base = { line, raw };
+
+    try {
+      const var_match = STATEMENT_PATTERN.exec(raw);
+      if (var_match) {
+        const [, path, operator, source] = var_match;
+        results.push({
+          ok: true,
+          statement: {
+            ...base,
+            kind: 'var',
+            name: path!,
+            alias: '',
+            params: [],
+            operator: operator as AssignmentOperator,
+            expression: parseExpression(source ?? ''),
+          },
+        });
+        return;
+      }
+
+      const let_match = LET_PATTERN.exec(raw);
+      if (let_match) {
+        const [, name, source] = let_match;
+        const expression = parseExpression(source ?? '');
+        const alias = astToPath(expression);
+        if (alias === null) {
+          throw new StatementError('let 的右侧必须是一个路径, 例如 `let y = 微分方程.题11_y`');
+        }
+        results.push({
+          ok: true,
+          statement: { ...base, kind: 'let', name: name!, alias, params: [], operator: '=', expression },
+        });
+        return;
+      }
+
+      const define_match = DEFINE_PATTERN.exec(raw);
+      if (define_match) {
+        const [, name, param_source, source] = define_match;
+        const params = (param_source ?? '')
+          .split(',')
+          .map(item => item.trim())
+          .filter(item => item !== '');
+        for (const param of params) {
+          if (!IDENTIFIER_PATTERN.test(param)) {
+            throw new StatementError(`形参名 \`${param}\` 不合法, 只能是标识符`);
+          }
+        }
+        if (new Set(params).size !== params.length) {
+          throw new StatementError('形参名不能重复');
+        }
+        results.push({
+          ok: true,
+          statement: {
+            ...base,
+            kind: 'define',
+            name: name!,
+            alias: '',
+            params,
+            operator: '=',
+            expression: parseExpression(source ?? ''),
+          },
+        });
+        return;
+      }
+
+      // 行首像语句但整行不合法时给出提示, 而不是静默忽略
+      if (STATEMENT_LIKE_PATTERN.test(raw)) {
+        throw new StatementError(
+          '语句格式不合法, 应写成 `var <路径> <赋值符> <表达式>`、`let <短名> = <路径>` 或 `define <名字>(<形参>) = <表达式>`',
+        );
+      }
+    } catch (error) {
+      fail(error);
     }
   });
 
@@ -1464,12 +1727,23 @@ function assertArrayIndexInRange(data: Record<string, any>, path: string[]): voi
  * @returns 这条语句是否删除了路径(用于日志)
  * @throws 语句无法执行时抛出 `StatementError`
  */
-function applyStatement(data: Record<string, any>, statement: Statement): boolean {
-  const path = _.toPath(statement.path);
+function applyStatement(data: Record<string, any>, statement: Statement, env: Env): boolean {
+  // `let` / `define` 不写变量, 只登记到本块语句的局部环境里
+  if (statement.kind === 'let') {
+    // 右侧本身可能又用了更早的别名, 这里先解析掉, 别名表里存的永远是真实路径
+    env.aliases.set(statement.name, resolveAlias(statement.alias, env));
+    return false;
+  }
+  if (statement.kind === 'define') {
+    env.funcs.set(statement.name, { params: statement.params, body: statement.expression, line: statement.line });
+    return false;
+  }
+
+  const path = _.toPath(resolveAlias(statement.name, env));
   assertArrayIndexInRange(data, path);
   const exists = _.has(data, path);
   const current = exists ? _.get(data, path) : undefined;
-  const context: EvalContext = { data, subject: current, operator: statement.operator };
+  const context: EvalContext = { data, subject: current, operator: statement.operator, env };
 
   // `=` 且右侧是 null 表示删除路径
   if (statement.operator === '=') {
@@ -1499,17 +1773,17 @@ function applyStatement(data: Record<string, any>, statement: Statement): boolea
       }
       break;
     case '-=':
-      value = toNumber(base, `\`${statement.path}\` 的当前值`) - toNumber(operand, '右操作数');
+      value = toNumber(base, `\`${statement.name}\` 的当前值`) - toNumber(operand, '右操作数');
       break;
     case '*=':
-      value = toNumber(base, `\`${statement.path}\` 的当前值`) * toNumber(operand, '右操作数');
+      value = toNumber(base, `\`${statement.name}\` 的当前值`) * toNumber(operand, '右操作数');
       break;
     case '/=': {
       const divisor = toNumber(operand, '右操作数');
       if (divisor === 0) {
         throw new StatementError('除数为 0');
       }
-      value = toNumber(base, `\`${statement.path}\` 的当前值`) / divisor;
+      value = toNumber(base, `\`${statement.name}\` 的当前值`) / divisor;
       break;
     }
   }
@@ -1525,12 +1799,18 @@ function applyStatement(data: Record<string, any>, statement: Statement): boolea
 function executeStatements(data: Record<string, any>, statements: Statement[]): ExecutionResult {
   const errors: ExecutionResult['errors'] = [];
   const removed: string[] = [];
+  const env = createEnv();
   let applied = 0;
 
   for (const statement of statements) {
     try {
-      if (applyStatement(data, statement)) {
-        removed.push(statement.path);
+      const did_remove = applyStatement(data, statement, env);
+      // `let` / `define` 不写变量, 不计入写入条数
+      if (statement.kind !== 'var') {
+        continue;
+      }
+      if (did_remove) {
+        removed.push(resolveAlias(statement.name, env));
       }
       applied++;
     } catch (error) {
@@ -1562,11 +1842,12 @@ function repairStatements(
   const removed: string[] = [];
   let data = _.cloneDeep(base);
   let applied = 0;
+  const env = createEnv();
 
   for (const statement of statements) {
     const trial = _.cloneDeep(data);
     try {
-      const did_remove = applyStatement(trial, statement);
+      const did_remove = applyStatement(trial, statement, env);
       const check = checkSchema(trial);
       if (!check.ok) {
         rejected.push({
@@ -1578,8 +1859,11 @@ function repairStatements(
       }
       // 用校验后的结果继续, 后续语句看到的是规范化后的值
       data = check.data;
+      if (statement.kind !== 'var') {
+        continue;
+      }
       if (did_remove) {
-        removed.push(statement.path);
+        removed.push(resolveAlias(statement.name, env));
       }
       applied++;
     } catch (error) {
@@ -1951,6 +2235,21 @@ function applyStatementsToStatData(
 const COMMAND_REASON = 'MVU语句中间层';
 
 /**
+ * 路径在 `stat_data` 里还不存在时怎么写入.
+ *
+ * 部分 zod 脚本(`mag_command_parsed_for_zod` 的变体)会对 `set` 命令加一条硬规则:
+ * **路径必须已经存在, 否则跳过整条命令**. 于是 `var 新字段 = 值` 永远建不出新变量,
+ * 而这类写入恰恰是这个中间层最常见的用法.
+ *
+ * - `'direct'`(默认): 这类语句不进命令队列, 直接写进 `variables.stat_data`, 绕开命令闸门
+ * - `'command'`: 恢复成"一律注入命令"的旧行为
+ *
+ * 注意: `'direct'` 写入的值不会经过那份 zod 脚本的校验 —— 新路径本来也不在
+ * `stat_data` 里, 闸门除了"跳过"没有别的判断可做.
+ */
+const CREATE_MISSING_PATHS: 'direct' | 'command' = 'direct';
+
+/**
  * 把正文里的语句编译成 MVU 命令.
  *
  * **不直接改 `variables.stat_data`**, 而是产出一组 `CommandInfo` 追加到 MVU 的命令数组:
@@ -1962,18 +2261,29 @@ const COMMAND_REASON = 'MVU语句中间层';
  *
  * 命令一律注入**绝对终值**: 值走 `JSON.stringify`, 字符串的引号因此得以保留,
  * 不会在 MVU 侧被当成表达式再算一遍.
+ *
+ * 写入分两路(见 `CREATE_MISSING_PATHS`):
+ * - 路径已存在于 `stat_data` → 产出命令, 交回 MVU 走校验链
+ * - 路径还不存在 → 产出到 `creates`, 由调用方直接写进 `variables.stat_data`
  */
 function compileToCommands(
   message: string,
   stat_data: Record<string, any>,
-): { commands: Mvu.CommandInfo[]; applied: number; removed: string[]; errors: ExecutionResult['errors'] } {
+): {
+  commands: Mvu.CommandInfo[];
+  creates: Array<{ path: string; value: string }>;
+  applied: number;
+  removed: string[];
+  errors: ExecutionResult['errors'];
+} {
   const commands: Mvu.CommandInfo[] = [];
+  const creates: Array<{ path: string; value: string }> = [];
   const removed: string[] = [];
   const errors: ExecutionResult['errors'] = [];
 
   const parsed = parseStatements(message);
   if (parsed.length === 0) {
-    return { commands, applied: 0, removed, errors };
+    return { commands, creates, applied: 0, removed, errors };
   }
 
   const syntax_errors = parsed.filter(line => !line.ok);
@@ -1983,11 +2293,12 @@ function compileToCommands(
         errors.push({ line: line.line, raw: line.raw, message: line.message });
       }
     }
-    return { commands, applied: 0, removed, errors };
+    return { commands, creates, applied: 0, removed, errors };
   }
 
   // 在 working copy 上按书写顺序累积, 后面的表达式能看到前面改过的值
   const working = _.cloneDeep(stat_data);
+  const env = createEnv();
   let applied = 0;
 
   for (const line of parsed) {
@@ -1997,21 +2308,37 @@ function compileToCommands(
     }
     const statement = line.statement;
     try {
-      const is_removed = applyStatement(working, statement);
+      const is_removed = applyStatement(working, statement, env);
+      // `let` / `define` 只是本块内的写法糖, 不产生 MVU 命令
+      if (statement.kind !== 'var') {
+        continue;
+      }
+      // 路径可能被 `let` 别名缩短过, 命令里必须写别名指向的真实路径
+      const path = resolveAlias(statement.name, env);
+      // 基准里不存在的路径: 部分 zod 脚本会把这类 `set` 整条跳过, 于是改成直接写入
+      const existed = _.has(stat_data, _.toPath(path));
+      if (CREATE_MISSING_PATHS === 'direct' && !existed) {
+        if (!is_removed) {
+          const value = _.get(working, _.toPath(path));
+          creates.push({ path, value: JSON.stringify(value) ?? 'null' });
+        }
+        applied++;
+        continue;
+      }
       if (is_removed) {
-        removed.push(statement.path);
+        removed.push(path);
         commands.push({
           type: 'delete',
           full_match: statement.raw,
-          args: [statement.path],
+          args: [path],
           reason: COMMAND_REASON,
         });
       } else {
-        const value = _.get(working, _.toPath(statement.path));
+        const value = _.get(working, _.toPath(path));
         commands.push({
           type: 'set',
           full_match: statement.raw,
-          args: [statement.path, JSON.stringify(value) ?? 'null'],
+          args: [path, JSON.stringify(value) ?? 'null'],
           reason: COMMAND_REASON,
         });
       }
@@ -2025,7 +2352,7 @@ function compileToCommands(
     }
   }
 
-  return { commands, applied, removed, errors };
+  return { commands, creates, applied, removed, errors };
 }
 
 /** 读取某楼层的 MvuData; 楼层不存在或读取失败时给出空壳 */
@@ -2055,12 +2382,28 @@ function getPreviousStatData(message_id: number): Record<string, any> | null {
 }
 
 /**
+ * 判断这一楼是不是最新的一条 AI 楼层.
+ *
+ * 只有最新 AI 楼层被编辑时才重算: 更早的楼层之上已经堆了别的楼层,
+ * 它们仍然建立在旧值上, 单独重算这一楼会让同一份变量出现两套历史.
+ */
+function isLatestAssistantMessage(message_id: number): boolean {
+  const messages = getChatMessages(`0-${getLastMessageId()}`, { role: 'assistant' });
+  return messages.length > 0 && messages[messages.length - 1]!.message_id === message_id;
+}
+
+/**
  * 用户在酒馆里编辑了楼层正文之后, 重新解析这份正文并更新变量.
  *
  * 与主路径的区别: MVU 不监听 `MESSAGE_EDITED`, 所以这里必须自己把结果写回楼层.
  * `MESSAGE_EDITED` 按酒馆文档专指"用户编辑", 脚本改消息走 `MESSAGE_UPDATED`, 因此不会互相触发.
  */
 async function reprocessFloor(message_id: number): Promise<void> {
+  if (!isLatestAssistantMessage(message_id)) {
+    console.info(`[MVU 语句中间层] 第 ${message_id} 楼不是最新 AI 楼层, 跳过编辑重算`);
+    return;
+  }
+
   const message = getChatMessages(message_id)[0]?.message;
   if (!message || parseStatements(message).length === 0) {
     return;
@@ -2097,9 +2440,20 @@ function onCommandParsed(variables: Mvu.MvuData, commands: Mvu.CommandInfo[], me
     if (outcome.commands.length > 0) {
       commands.push(...outcome.commands);
     }
+    // 新路径不进命令队列, 直接写进楼层变量:
+    // 有些 zod 脚本会把"路径还不存在"的 `set` 整条跳过, 走命令就永远建不出新变量
+    let created = 0;
+    if (outcome.creates.length > 0) {
+      const stat_data: Record<string, any> = (variables.stat_data ??= {});
+      for (const item of outcome.creates) {
+        _.set(stat_data, _.toPath(item.path), JSON.parse(item.value));
+        created++;
+      }
+    }
     if (outcome.applied > 0) {
       console.info(
-        `[MVU 语句中间层] 已注入 ${outcome.applied} 条命令` +
+        `[MVU 语句中间层] 已注入 ${outcome.commands.length} 条命令` +
+          (created > 0 ? `, 直写 ${created} 个新路径` : '') +
           (outcome.removed.length > 0 ? `, 删除 ${outcome.removed.length} 个路径` : ''),
       );
     }
@@ -2130,6 +2484,6 @@ $(() => {
       });
     });
 
-    console.info('[MVU 语句中间层] 已加载 (注入 MVU 命令 + 编辑正文后重算)');
+    console.info('[MVU 语句中间层] 已加载 (注入 MVU 命令 + 编辑最新 AI 楼层后重算)');
   })();
 });
